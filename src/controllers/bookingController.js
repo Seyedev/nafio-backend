@@ -27,19 +27,20 @@ exports.getAvailableSlots = async (req, res) => {
     });
     if (!proUser || !proUser.proProfile) return res.status(404).json({ message: 'Professionnelle non trouvée' });
 
-    // Vérifier si le pro est ouvert ce jour-là (commun à tous les modes)
+    // 1. Récupérer TOUTES les plages de disponibilité pour ce jour
     const dayOfWeekName = dayMapping[new Date(`${date}T00:00:00Z`).getUTCDay()];
-    const availability = await Availability.findOne({
+    const availabilities = await Availability.findAll({
       where: {
         pro_id: proUser.proProfile.id,
         day_of_week: dayOfWeekName
       }
     });
 
-    if (!availability) {
+    if (availabilities.length === 0) {
       return res.json({ date, ferme: true, type: service.type_reservation === 'capacite_periode' ? 'periode' : 'horaire', periods: {}, slots: [] });
     }
 
+    // MODE : CAPACITE PERIODE
     if (service.type_reservation === 'capacite_periode') {
       const periods = service.capacites_periodes || {};
       const results = {};
@@ -67,7 +68,7 @@ exports.getAvailableSlots = async (req, res) => {
       return res.json({ date, ferme: false, type: 'periode', periods: results });
     }
 
-    // Logique pour exclusif et capacite_horaire
+    // MODES : EXCLUSIF ET CAPACITE HORAIRE
     const existingBookings = await Booking.findAll({
       where: {
         pro_id,
@@ -90,24 +91,36 @@ exports.getAvailableSlots = async (req, res) => {
         const slotStart = new Date(current);
         const slotEnd = new Date(slotStart.getTime() + service.duree_minutes * 60000);
 
-        if (slotEnd > limit) break;
-
-        const bookingsAtThisTime = existingBookings.filter(b => {
-          if (!b.start_time || !b.end_time) return false;
-          const bStart = new Date(b.start_time);
-          const bEnd = new Date(b.end_time);
-          return (slotStart < bEnd && slotEnd > bStart);
-        });
+        // Exclure si le service dépasse la fin de la plage de travail
+        if (slotEnd > limit) {
+          current.setMinutes(current.getMinutes() + step);
+          continue;
+        }
 
         let isAvailable = false;
         let placesRestantes = 1;
 
         if (service.type_reservation === 'exclusif') {
-          isAvailable = bookingsAtThisTime.length === 0;
+          // LOGIQUE EXCLUSIF : Aucun chevauchement sur TOUTE la durée
+          const isOverlap = existingBookings.some(b => {
+            if (!b.start_time || !b.end_time) return false;
+            const bStart = new Date(b.start_time);
+            const bEnd = new Date(b.end_time);
+            // Formule de chevauchement : (Debut1 < Fin2) ET (Fin1 > Debut2)
+            return (slotStart < bEnd && slotEnd > bStart);
+          });
+          isAvailable = !isOverlap;
         } else if (service.type_reservation === 'capacite_horaire') {
+          // LOGIQUE CAPACITE HORAIRE : Uniquement sur le créneau de départ précis
+          const count = existingBookings.filter(b => {
+            if (!b.start_time) return false;
+            const bStart = new Date(b.start_time);
+            return bStart.getTime() === slotStart.getTime();
+          }).length;
+
           const max = service.capacite_max || 1;
-          isAvailable = bookingsAtThisTime.length < max;
-          placesRestantes = max - bookingsAtThisTime.length;
+          isAvailable = count < max;
+          placesRestantes = max - count;
         }
 
         if (isAvailable) {
@@ -120,11 +133,6 @@ exports.getAvailableSlots = async (req, res) => {
         current.setMinutes(current.getMinutes() + step);
       }
     });
-
-    // Si après avoir parcouru toutes les disponibilités, aucun créneau n'est généré
-    if (slots.length === 0) {
-       return res.json({ date, ferme: false, type: 'horaire', slots: [], message: "Complet pour ce jour" });
-    }
 
     res.json({ date, ferme: false, type: 'horaire', slots });
   } catch (error) {
@@ -201,30 +209,36 @@ exports.createBooking = async (req, res) => {
       const start_time = new Date(`${date}T${start_time_str}:00Z`);
       const end_time = new Date(start_time.getTime() + service.duree_minutes * 60000);
 
-      const overlaps = await Booking.findAll({
-        where: {
-          pro_id,
-          date,
-          status: { [Op.in]: ['pending', 'accepted'] },
-          [Op.or]: [
-            {
-              start_time: { [Op.lt]: end_time },
-              end_time: { [Op.gt]: start_time }
-            }
-          ]
-        },
-        transaction: t,
-        lock: t.LOCK.UPDATE
-      });
-
       if (service.type_reservation === 'exclusif') {
-        if (overlaps.length > 0) {
-          throw new Error("Ce créneau n'est plus disponible.");
-        }
+        const overlap = await Booking.findOne({
+          where: {
+            pro_id,
+            date,
+            status: { [Op.in]: ['pending', 'accepted'] },
+            [Op.or]: [
+              {
+                start_time: { [Op.lt]: end_time },
+                end_time: { [Op.gt]: start_time }
+              }
+            ]
+          },
+          transaction: t,
+          lock: t.LOCK.UPDATE
+        });
+        if (overlap) throw new Error("Ce créneau n'est plus disponible.");
       } else {
-        if (overlaps.length >= (service.capacite_max || 1)) {
-          throw new Error("Ce créneau est complet.");
-        }
+        // capacite_horaire
+        const count = await Booking.count({
+          where: {
+            pro_id,
+            date,
+            start_time,
+            status: { [Op.in]: ['pending', 'accepted'] }
+          },
+          transaction: t,
+          lock: t.LOCK.UPDATE
+        });
+        if (count >= (service.capacite_max || 1)) throw new Error("Ce créneau est complet.");
       }
 
       bookingData.start_time = start_time;
