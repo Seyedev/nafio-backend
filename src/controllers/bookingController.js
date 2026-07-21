@@ -28,7 +28,9 @@ exports.getAvailableSlots = async (req, res) => {
     if (!proUser || !proUser.proProfile) return res.status(404).json({ message: 'Professionnelle non trouvée' });
 
     // 1. Récupérer TOUTES les plages de disponibilité pour ce jour
-    const dayOfWeekName = dayMapping[new Date(`${date}T00:00:00Z`).getUTCDay()];
+    const dayOfWeekIndex = new Date(`${date}T00:00:00Z`).getUTCDay();
+    const dayOfWeekName = dayMapping[dayOfWeekIndex];
+
     const availabilities = await Availability.findAll({
       where: {
         pro_id: proUser.proProfile.id,
@@ -36,8 +38,15 @@ exports.getAvailableSlots = async (req, res) => {
       }
     });
 
-    if (availabilities.length === 0) {
-      return res.json({ date, ferme: true, type: service.type_reservation === 'capacite_periode' ? 'periode' : 'horaire', periods: {}, slots: [] });
+    // Si aucune disponibilité trouvée pour ce jour
+    if (!availabilities || availabilities.length === 0) {
+      return res.json({
+        date,
+        ferme: true,
+        type: service.type_reservation === 'capacite_periode' ? 'periode' : 'horaire',
+        periods: {},
+        slots: []
+      });
     }
 
     // MODE : CAPACITE PERIODE
@@ -106,7 +115,6 @@ exports.getAvailableSlots = async (req, res) => {
             if (!b.start_time || !b.end_time) return false;
             const bStart = new Date(b.start_time);
             const bEnd = new Date(b.end_time);
-            // Formule de chevauchement : (Debut1 < Fin2) ET (Fin1 > Debut2)
             return (slotStart < bEnd && slotEnd > bStart);
           });
           isAvailable = !isOverlap;
@@ -161,7 +169,9 @@ exports.createBooking = async (req, res) => {
     });
 
     // Vérifier disponibilité du jour
-    const dayOfWeekName = dayMapping[new Date(`${date}T00:00:00Z`).getUTCDay()];
+    const dayOfWeekIndex = new Date(`${date}T00:00:00Z`).getUTCDay();
+    const dayOfWeekName = dayMapping[dayOfWeekIndex];
+
     const isAvailableDay = await Availability.findOne({
       where: { pro_id: proUser.proProfile.id, day_of_week: dayOfWeekName }
     });
@@ -227,7 +237,6 @@ exports.createBooking = async (req, res) => {
         });
         if (overlap) throw new Error("Ce créneau n'est plus disponible.");
       } else {
-        // capacite_horaire
         const count = await Booking.count({
           where: {
             pro_id,
