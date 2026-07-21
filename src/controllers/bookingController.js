@@ -27,10 +27,12 @@ exports.getAvailableSlots = async (req, res) => {
     });
     if (!proUser || !proUser.proProfile) return res.status(404).json({ message: 'Professionnelle non trouvée' });
 
-    // 1. Récupérer TOUTES les plages de disponibilité pour ce jour
-    const dayOfWeekIndex = new Date(`${date}T00:00:00Z`).getUTCDay();
-    const dayOfWeekName = dayMapping[dayOfWeekIndex];
+    const now = new Date(); // Heure actuelle du serveur
+    const todayStr = now.toISOString().split('T')[0];
+    const isToday = date === todayStr;
 
+    // 1. Récupérer TOUTES les plages de disponibilité pour ce jour
+    const dayOfWeekName = dayMapping[new Date(`${date}T00:00:00Z`).getUTCDay()];
     const availabilities = await Availability.findAll({
       where: {
         pro_id: proUser.proProfile.id,
@@ -38,15 +40,8 @@ exports.getAvailableSlots = async (req, res) => {
       }
     });
 
-    // Si aucune disponibilité trouvée pour ce jour
-    if (!availabilities || availabilities.length === 0) {
-      return res.json({
-        date,
-        ferme: true,
-        type: service.type_reservation === 'capacite_periode' ? 'periode' : 'horaire',
-        periods: {},
-        slots: []
-      });
+    if (availabilities.length === 0) {
+      return res.json({ date, ferme: true, type: service.type_reservation === 'capacite_periode' ? 'periode' : 'horaire', periods: {}, slots: [] });
     }
 
     // MODE : CAPACITE PERIODE
@@ -56,6 +51,13 @@ exports.getAvailableSlots = async (req, res) => {
 
       for (const [key, config] of Object.entries(periods)) {
         if (!config.capacite || config.capacite <= 0) continue;
+
+        // Si c'est aujourd'hui, on vérifie si la période est déjà passée
+        if (isToday && config.fin) {
+          const [endH, endM] = config.fin.split(':').map(Number);
+          const periodEnd = new Date(`${date}T${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}:00Z`);
+          if (now > periodEnd) continue; // Période terminée pour aujourd'hui
+        }
 
         const count = await Booking.count({
           where: {
@@ -100,7 +102,13 @@ exports.getAvailableSlots = async (req, res) => {
         const slotStart = new Date(current);
         const slotEnd = new Date(slotStart.getTime() + service.duree_minutes * 60000);
 
-        // Exclure si le service dépasse la fin de la plage de travail
+        // 1. Filtrer les créneaux passés si c'est aujourd'hui
+        if (isToday && now > slotStart) {
+          current.setMinutes(current.getMinutes() + step);
+          continue;
+        }
+
+        // 2. Exclure si le service dépasse la fin de la plage de travail
         if (slotEnd > limit) {
           current.setMinutes(current.getMinutes() + step);
           continue;
@@ -169,9 +177,7 @@ exports.createBooking = async (req, res) => {
     });
 
     // Vérifier disponibilité du jour
-    const dayOfWeekIndex = new Date(`${date}T00:00:00Z`).getUTCDay();
-    const dayOfWeekName = dayMapping[dayOfWeekIndex];
-
+    const dayOfWeekName = dayMapping[new Date(`${date}T00:00:00Z`).getUTCDay()];
     const isAvailableDay = await Availability.findOne({
       where: { pro_id: proUser.proProfile.id, day_of_week: dayOfWeekName }
     });
@@ -179,6 +185,9 @@ exports.createBooking = async (req, res) => {
     if (!isAvailableDay) {
       throw new Error("Le professionnel n'est pas disponible ce jour-là.");
     }
+
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0];
 
     let bookingData = {
       client_id: req.user.id,
@@ -193,6 +202,13 @@ exports.createBooking = async (req, res) => {
 
       const config = (service.capacites_periodes || {})[periode];
       if (!config || !config.capacite) throw new Error('Période invalide ou désactivée');
+
+      // Vérifier si la période est passée pour aujourd'hui
+      if (date === todayStr && config.fin) {
+        const [endH, endM] = config.fin.split(':').map(Number);
+        const periodEnd = new Date(`${date}T${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}:00Z`);
+        if (now > periodEnd) throw new Error("Cette période est déjà passée pour aujourd'hui.");
+      }
 
       const count = await Booking.count({
         where: {
@@ -217,6 +233,12 @@ exports.createBooking = async (req, res) => {
       if (!start_time_str) throw new Error('Heure de début manquante');
 
       const start_time = new Date(`${date}T${start_time_str}:00Z`);
+
+      // Vérifier si le créneau est passé pour aujourd'hui
+      if (date === todayStr && now > start_time) {
+        throw new Error("Ce créneau est déjà passé.");
+      }
+
       const end_time = new Date(start_time.getTime() + service.duree_minutes * 60000);
 
       if (service.type_reservation === 'exclusif') {
