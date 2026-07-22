@@ -83,7 +83,9 @@ exports.listPros = async (req, res) => {
   try {
     const { domaine_activite, zone, service, prix_min, prix_max } = req.query;
 
+    const userWhere = { role: 'pro' };
     const profileWhere = { validated: true };
+
     if (domaine_activite && domaine_activite.trim() !== '') {
       profileWhere.domaine_activite = domaine_activite;
     }
@@ -95,8 +97,10 @@ exports.listPros = async (req, res) => {
     let filterByService = false;
 
     if (service && service.trim() !== '') {
+      // Recherche combinée : Nom du pro OU Nom du service
+      userWhere.name = { [Op.like]: `%${service}%` };
       serviceWhere.name = { [Op.like]: `%${service}%` };
-      filterByService = true;
+      // Note: On utilisera Op.or global plus bas ou on filtre côté applicatif si complexe
     }
 
     const hasMin = prix_min !== undefined && prix_min !== '';
@@ -113,8 +117,40 @@ exports.listPros = async (req, res) => {
       }
     }
 
+    // Si on cherche par mot-clé (service), on veut les pros qui matchent par nom OU par service
+    if (service && service.trim() !== '') {
+        const pros = await User.findAll({
+            where: {
+                role: 'pro',
+                [Op.or]: [
+                    { name: { [Op.like]: `%${service}%` } },
+                    { '$proProfile.services.name$': { [Op.like]: `%${service}%` } }
+                ]
+            },
+            attributes: ['id', 'name', 'phone', 'photo_profil'],
+            distinct: true,
+            include: [
+                {
+                    model: ProProfile,
+                    as: 'proProfile',
+                    where: profileWhere,
+                    required: true,
+                    include: [
+                        {
+                            model: Service,
+                            as: 'services',
+                            attributes: ['name', 'price', 'duree_minutes', 'description'],
+                            required: false // On veut quand même le pro même s'il matchait par son nom
+                        }
+                    ]
+                }
+            ]
+        });
+        return res.json(pros);
+    }
+
     const pros = await User.findAll({
-      where: { role: 'pro' },
+      where: userWhere,
       attributes: ['id', 'name', 'phone', 'photo_profil'],
       distinct: true,
       include: [
